@@ -1,0 +1,107 @@
+name: Sync Fork
+
+# This workflow keeps your fork's main branch up to date with the
+# upstream (original) repository.
+#
+# Mode: opens a Pull Request with upstream changes instead of pushing
+# directly. This lets you review upstream changes before they land,
+# and never fails/overwrites anything if your fork has diverged --
+# it just opens (or updates) a PR for you to merge manually.
+#
+# Setup:
+#   1. Replace ORIGINAL_OWNER, REPOSITORY, and the branch names below.
+#   2. No extra secrets needed -- uses the built-in GITHUB_TOKEN.
+#   3. PRs opened by GITHUB_TOKEN don't trigger other workflows by
+#      default (to avoid infinite loops). If you need that, create a
+#      Personal Access Token, store it as a repo secret (e.g. SYNC_PAT),
+#      and swap `secrets.GITHUB_TOKEN` for `secrets.SYNC_PAT` below.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # daily at 00:00 UTC
+  workflow_dispatch:        # allows manual trigger from the Actions tab
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_URL: https://github.com/Cisco-Talos/IOCs.git
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || \
+          git remote set-url upstream "$UPSTREAM_URL"
+
+      - name: Fetch upstream
+        run: git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Check if already up to date
+        id: diff
+        run: |
+          if git diff --quiet HEAD "upstream/$UPSTREAM_BRANCH"; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Try fast-forward merge (fast path)
+        id: fastforward
+        if: steps.diff.outputs.up_to_date == 'false'
+        run: |
+          if git merge --ff-only "upstream/$UPSTREAM_BRANCH"; then
+            echo "fast_forwarded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fast_forwarded=false" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+          fi
+
+      - name: Push fast-forwarded branch directly
+        if: steps.fastforward.outputs.fast_forwarded == 'true'
+        run: git push origin "$FORK_BRANCH"
+
+      - name: Create sync branch for review (diverged history)
+        if: steps.fastforward.outputs.fast_forwarded == 'false'
+        run: |
+          SYNC_BRANCH="sync/upstream-$(date +%Y%m%d-%H%M)"
+          echo "SYNC_BRANCH=$SYNC_BRANCH" >> "$GITHUB_ENV"
+          git checkout -b "$SYNC_BRANCH"
+          git merge "upstream/$UPSTREAM_BRANCH" -X theirs --no-edit || true
+          git push origin "$SYNC_BRANCH"
+
+      - name: Open pull request
+        if: steps.fastforward.outputs.fast_forwarded == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "Sync fork with upstream ($UPSTREAM_BRANCH)" \
+            --body "Automated sync: this PR merges changes from \`$UPSTREAM_URL\` (\`$UPSTREAM_BRANCH\`) into \`$FORK_BRANCH\`. Your fork had diverged, so this was opened for manual review instead of being pushed directly." \
+            --base "$FORK_BRANCH" \
+            --head "$SYNC_BRANCH" || echo "PR may already exist, skipping"
+
+      - name: Nothing to sync
+        if: steps.diff.outputs.up_to_date == 'true'
+        run: echo "Fork is already up to date with upstream. Nothing to do."
